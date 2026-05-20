@@ -1,18 +1,19 @@
 """Config flow for TransportMe Bus Tracker.
 
-Authentication happens in a browser page served by HA itself — no manual
-token copy-pasting required for email/password users.  Google users follow a
-short token-paste flow from that same page.
+Authentication uses a HA-hosted sign-in page opened via a link in the config
+flow form.  Tokens are stored in hass.data by the callback view; the flow step
+picks them up when the user clicks Submit.  This avoids async_configure on an
+EXTERNAL_STEP flow (which is not supported in modern HA).
 
 Config flow steps
 -----------------
-  user    – opens external sign-in page; resumes when callback posts tokens
+  user    – form with sign-in link; callback stores tokens; Submit picks them up
   routes  – subscription ID (auto-discovered), stop coords, poll interval
 
 Options flow steps
 ------------------
-  init           – pre-filled settings + "Re-authenticate" toggle
-  reauth         – opens external sign-in page when toggle is ticked
+  init    – pre-filled settings + "Sign in again" toggle
+  reauth  – same form-with-link pattern for re-auth
 """
 from __future__ import annotations
 
@@ -56,6 +57,11 @@ def _ha_url(hass) -> str:
         return get_url(hass, prefer_external=False)
     except Exception:
         return ""
+
+
+def _pending_key(flow_id: str) -> str:
+    """hass.data key where the callback view stores auth tokens for a flow."""
+    return f"{DOMAIN}_pending_{flow_id}"
 
 
 async def _discover_subscription_id(id_token: str) -> str:
@@ -113,7 +119,7 @@ async def _discover_subscription_id(id_token: str) -> str:
 # ---------------------------------------------------------------------------
 
 class TransportMeConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
-    """Two-step config flow: browser sign-in → route settings."""
+    """Two-step config flow: sign-in link → route settings."""
 
     VERSION = 1
 
@@ -124,17 +130,11 @@ class TransportMeConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self._discovered_sub: str = ""
 
     # ------------------------------------------------------------------
-    # Step 1 – External browser sign-in
+    # View registration helper
     # ------------------------------------------------------------------
 
     def _ensure_views(self) -> None:
-        """Register HTTP views if not already done.
-
-        async_setup in __init__.py handles this at startup, but when HA loads
-        the component for the first time solely to run a config flow (no existing
-        entries) async_setup may not have been awaited yet.  Registering here is
-        a safe no-op if the views are already registered.
-        """
+        """Register HTTP views if not already done."""
         key = f"{DOMAIN}_views_registered"
         if self.hass.data.get(key):
             return
@@ -143,30 +143,46 @@ class TransportMeConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self.hass.http.register_view(TransportMeCallbackView())
         self.hass.data[key] = True
 
+    # ------------------------------------------------------------------
+    # Step 1 – Sign-in form with link
+    # ------------------------------------------------------------------
+
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
     ) -> FlowResult:
         """
-        First call: redirect user to the HA-hosted sign-in page.
-        Second call (via callback view): user_input contains {id_token,
-        refresh_token, email} — verify, discover routes, go to step 2.
+        First call (user_input=None): show form with sign-in link.
+        Second call (Submit clicked): pick up tokens stored by callback view.
         """
         self._ensure_views()
+        errors: dict[str, str] = {}
 
-        if user_input and "id_token" in user_input:
-            # Tokens received from the sign-in page via the callback endpoint.
-            # The callback view already verified the token; call again to get
-            # fav_operator_id which we use for route discovery.
-            self._id_token      = user_input["id_token"]
-            self._refresh_token = user_input["refresh_token"]
-            self._pax_user      = await verify_transportme_token(self._id_token)
-            self._discovered_sub = await _discover_subscription_id(self._id_token)
-            return await self.async_step_routes()
+        if user_input is not None:
+            # User clicked Submit — check for tokens stored by the callback view
+            auth_data = self.hass.data.pop(_pending_key(self.flow_id), None)
+            if not auth_data:
+                errors["base"] = "auth_not_completed"
+            else:
+                self._id_token       = auth_data["id_token"]
+                self._refresh_token  = auth_data["refresh_token"]
+                self._pax_user       = await verify_transportme_token(self._id_token)
+                self._discovered_sub = await _discover_subscription_id(self._id_token)
+                return await self.async_step_routes()
 
-        # Open the HA-hosted sign-in page in the user's browser.
-        base = _ha_url(self.hass)
-        url  = f"{base}/api/transportme/auth?flow_id={self.flow_id}&flow_type=config"
-        return self.async_external_step(step_id="user", url=url)
+        # Reserve slot in hass.data (callback view writes here after sign-in)
+        key = _pending_key(self.flow_id)
+        if key not in self.hass.data:
+            self.hass.data[key] = None
+
+        base     = _ha_url(self.hass)
+        auth_url = f"{base}/api/transportme/auth?flow_id={self.flow_id}&flow_type=config"
+
+        return self.async_show_form(
+            step_id="user",
+            data_schema=vol.Schema({}),
+            errors=errors,
+            description_placeholders={"auth_url": auth_url},
+        )
 
     # ------------------------------------------------------------------
     # Step 2 – Route settings (auto-populated when possible)
@@ -184,9 +200,7 @@ class TransportMeConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         if user_input is not None:
             sub_id = user_input[CONF_SUBSCRIPTION_ID].strip()
             if not sub_id or ":" not in sub_id:
-                errors[CONF_SUBSCRIPTION_ID] = (
-                    "Enter as  operator_id:route_id,route_id  —  e.g. 123:1,2,3"
-                )
+                errors[CONF_SUBSCRIPTION_ID] = "invalid_sub_id"
             if not errors:
                 await self.async_set_unique_id(f"{DOMAIN}_{sub_id}")
                 self._abort_if_unique_id_configured()
@@ -224,10 +238,11 @@ class TransportMeConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 f"(user {self._pax_user.get('id', '')})"
             )
 
-        if self._discovered_sub:
-            hint = f"Routes auto-discovered: {self._discovered_sub}"
-        else:
-            hint = "Format:  operator_id:route_id,route_id,...  e.g. 123:1,2,3"
+        hint = (
+            f"Routes auto-discovered: {self._discovered_sub}"
+            if self._discovered_sub
+            else "Format:  operator_id:route_id,route_id,...  e.g. 123:1,2,3"
+        )
 
         return self.async_show_form(
             step_id="routes",
@@ -253,8 +268,8 @@ class TransportMeConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 class TransportMeOptionsFlow(config_entries.OptionsFlow):
     """
     Configure page:
-      init   – pre-filled settings + Re-authenticate toggle
-      reauth – external browser sign-in (only when toggle is ticked)
+      init   – pre-filled settings + "Sign in again" toggle
+      reauth – form with sign-in link
     """
 
     def __init__(self, config_entry: config_entries.ConfigEntry) -> None:
@@ -309,33 +324,50 @@ class TransportMeOptionsFlow(config_entries.OptionsFlow):
         )
 
     # ------------------------------------------------------------------
-    # Step reauth – external browser sign-in
+    # Step reauth – form with sign-in link
     # ------------------------------------------------------------------
 
     async def async_step_reauth(
         self, user_input: dict[str, Any] | None = None
     ) -> FlowResult:
         """
-        First call: open browser sign-in page.
-        Second call (via callback): tokens received → save.
+        First call: show form with sign-in link.
+        Submit: pick up tokens stored by callback view.
         """
-        # Views may not be registered if HA was restarted since initial setup
-        key = f"{DOMAIN}_views_registered"
-        if not self.hass.data.get(key):
+        # Ensure views are registered
+        reg_key = f"{DOMAIN}_views_registered"
+        if not self.hass.data.get(reg_key):
             from .views import TransportMeAuthView, TransportMeCallbackView
             self.hass.http.register_view(TransportMeAuthView())
             self.hass.http.register_view(TransportMeCallbackView())
-            self.hass.data[key] = True
+            self.hass.data[reg_key] = True
 
-        if user_input and "id_token" in user_input:
-            self._id_token      = user_input["id_token"]
-            self._refresh_token = user_input["refresh_token"]
-            self._pending["signed_in_email"] = user_input.get("email", "")
-            return self._save(self._pending)
+        errors: dict[str, str] = {}
 
-        base = _ha_url(self.hass)
-        url  = f"{base}/api/transportme/auth?flow_id={self.flow_id}&flow_type=options"
-        return self.async_external_step(step_id="reauth", url=url)
+        if user_input is not None:
+            auth_data = self.hass.data.pop(_pending_key(self.flow_id), None)
+            if not auth_data:
+                errors["base"] = "auth_not_completed"
+            else:
+                self._id_token      = auth_data["id_token"]
+                self._refresh_token = auth_data["refresh_token"]
+                self._pending["signed_in_email"] = auth_data.get("email", "")
+                return self._save(self._pending)
+
+        # Reserve slot and build URL
+        pkey = _pending_key(self.flow_id)
+        if pkey not in self.hass.data:
+            self.hass.data[pkey] = None
+
+        base     = _ha_url(self.hass)
+        auth_url = f"{base}/api/transportme/auth?flow_id={self.flow_id}&flow_type=options"
+
+        return self.async_show_form(
+            step_id="reauth",
+            data_schema=vol.Schema({}),
+            errors=errors,
+            description_placeholders={"auth_url": auth_url},
+        )
 
     # ------------------------------------------------------------------
     # Save helper

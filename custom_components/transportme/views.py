@@ -18,6 +18,8 @@ from aiohttp import web
 
 from homeassistant.components.http import HomeAssistantView
 
+from .const import DOMAIN
+
 _LOGGER = logging.getLogger(__name__)
 
 GRAPHQL_URL = "https://production.api2.transportme.com.au/"
@@ -277,7 +279,7 @@ _AUTH_HTML = """\
       if (e.code === "auth/unauthorized-domain") {
         // Firebase blocked the popup — show localhost URL alternative
         const here    = window.location.href;
-        const lhUrl   = here.replace(/^https?:\/\/[^\/]+/, "http://localhost:8123");
+        const lhUrl   = here.replace(/^https?:[/][/][^/]+/, "http://localhost:8123");
         document.getElementById("localhost-url").textContent = lhUrl;
         document.getElementById("goog-localhost-hint").style.display = "";
         showErr(
@@ -342,8 +344,8 @@ _AUTH_HTML = """\
       <div class="success">
         <div class="icon">✅</div>
         <h2>Signed in successfully!</h2>
-        <p>You can close this tab and return to Home Assistant.<br>
-           The setup will continue automatically.</p>
+        <p>Close this tab and return to Home Assistant.<br>
+           Click <strong>Submit</strong> in the dialog to continue.</p>
       </div>`;
   }
 
@@ -418,37 +420,15 @@ class TransportMeCallbackView(HomeAssistantView):
                 status=401,
             )
 
-        # Advance the correct flow manager
-        flow_mgr = hass.config_entries.options if flow_type == "options" else hass.config_entries.flow
-
-        # Check flow exists before trying to advance it
-        in_progress = flow_mgr.async_progress()
-        if not any(f["flow_id"] == flow_id for f in in_progress):
-            _LOGGER.warning(
-                "TransportMe callback: flow %s not found. In-progress flows: %s",
-                flow_id,
-                [f["flow_id"] for f in in_progress],
-            )
-            return web.json_response(
-                {"error": "session_expired", "detail": "Flow not found — it may have expired or HA was restarted."},
-                status=404,
-            )
-
-        try:
-            await flow_mgr.async_configure(
-                flow_id,
-                {
-                    "id_token":      id_token,
-                    "refresh_token": refresh_token,
-                    "email":         pax_user.get("email", ""),
-                },
-            )
-        except Exception as exc:
-            _LOGGER.exception("TransportMe callback: error advancing flow %s", flow_id)
-            exc_detail = f"{type(exc).__name__}: {exc}"
-            return web.json_response(
-                {"error": "flow_error", "detail": exc_detail},
-                status=500,
-            )
+        # Store auth data in hass.data — the config/options flow step picks it
+        # up when the user clicks Submit.  This avoids calling async_configure
+        # on an EXTERNAL_STEP flow, which modern HA does not support.
+        pending_key = f"{DOMAIN}_pending_{flow_id}"
+        hass.data[pending_key] = {
+            "id_token":      id_token,
+            "refresh_token": refresh_token,
+            "email":         pax_user.get("email", ""),
+        }
+        _LOGGER.debug("TransportMe callback: stored auth for flow %s (%s)", flow_id, pax_user.get("email", ""))
 
         return web.json_response({"success": True, "email": pax_user.get("email", "")})

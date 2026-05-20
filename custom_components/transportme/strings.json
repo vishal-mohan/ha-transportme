@@ -1,0 +1,48 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Sign in to TransportMe",
+        "description": "**Step 1 —** Open the sign-in page and authenticate with your TransportMe account:\n\n[Open TransportMe sign-in]({auth_url})\n\n**Step 2 —** After you see the \"Signed in successfully\" message, return here and click **Submit**.",
+        "data": {}
+      },
+      "routes": {
+        "title": "Configure routes",
+        "description": "{pax_info}\n\n{hint}",
+        "data": {
+          "subscription_id": "Subscription ID",
+          "stop_lat": "Stop latitude (optional)",
+          "stop_lon": "Stop longitude (optional)",
+          "scan_interval": "Update interval (seconds)"
+        }
+      }
+    },
+    "error": {
+      "auth_not_completed": "Please open the sign-in link above and complete sign-in before clicking Submit.",
+      "invalid_sub_id": "Enter as operator_id:route_id,route_id — e.g. 123:1,2,3"
+    },
+    "abort": {
+      "already_configured": "This TransportMe account is already configured."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "TransportMe settings",
+        "description": "Currently signed in as: **{signed_in_email}**",
+        "data": {
+          "subscription_id": "Subscription ID",
+          "stop_lat": "Stop latitude (optional)",
+          "stop_lon": "Stop longitude (optional)",
+          "scan_interval": "Update interval (seconds)",
+          "re_authenticate": "Sign in again"
+        }
+      },
+      "reauth": {
+        "title": "Re-authenticate",
+        "description": "**Step 1 —** Open the sign-in page:\n\n[Open TransportMe sign-in]({auth_url})\n\n**Step 2 —** After signing in, return here and click **Submit**.",
+        "data": {}
+      }
+    }
+  }
+}
