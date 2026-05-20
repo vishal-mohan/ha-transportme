@@ -18,6 +18,14 @@ from .coordinator import TransportMeCoordinator
 _LOGGER = logging.getLogger(__name__)
 
 
+async def async_setup(hass: HomeAssistant, config: dict) -> bool:
+    """Register HTTP views used by the config flow (runs on component load)."""
+    from .views import TransportMeAuthView, TransportMeCallbackView
+    hass.http.register_view(TransportMeAuthView())
+    hass.http.register_view(TransportMeCallbackView())
+    return True
+
+
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up TransportMe from a config entry."""
     hass.data.setdefault(DOMAIN, {})

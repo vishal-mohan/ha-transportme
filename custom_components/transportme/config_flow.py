@@ -1,4 +1,19 @@
-"""Config flow for TransportMe Bus Tracker – seamless Firebase auth built in."""
+"""Config flow for TransportMe Bus Tracker.
+
+Authentication happens in a browser page served by HA itself — no manual
+token copy-pasting required for email/password users.  Google users follow a
+short token-paste flow from that same page.
+
+Config flow steps
+-----------------
+  user    – opens external sign-in page; resumes when callback posts tokens
+  routes  – subscription ID (auto-discovered), stop coords, poll interval
+
+Options flow steps
+------------------
+  init           – pre-filled settings + "Re-authenticate" toggle
+  reauth         – opens external sign-in page when toggle is ticked
+"""
 from __future__ import annotations
 
 import logging
@@ -8,7 +23,7 @@ import aiohttp
 import voluptuous as vol
 
 from homeassistant import config_entries
-from homeassistant.core import HomeAssistant, callback
+from homeassistant.core import callback
 from homeassistant.data_entry_flow import FlowResult
 
 from .const import (
@@ -23,69 +38,74 @@ from .const import (
     DEFAULT_SCAN_INTERVAL,
     DOMAIN,
 )
+from .views import verify_transportme_token
 
 _LOGGER = logging.getLogger(__name__)
 
-# Public client-side key embedded in the TransportMe app bundle (safe to publish)
-FIREBASE_API_KEY   = "AIzaSyD9xVRwjC0V-FHj5D97pwD8oGUNCufs9vI"
-FIREBASE_SIGN_IN   = f"https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key={FIREBASE_API_KEY}"
-GRAPHQL_URL        = "https://production.api2.transportme.com.au/"
+GRAPHQL_URL = "https://production.api2.transportme.com.au/"
+
 
 # ---------------------------------------------------------------------------
-# Firebase helpers
+# Helpers
 # ---------------------------------------------------------------------------
 
-async def _firebase_sign_in(email: str, password: str) -> dict[str, str]:
-    """
-    Sign in to Firebase with email + password.
-    Returns {"id_token": ..., "refresh_token": ...} or raises ValueError.
-    """
-    async with aiohttp.ClientSession() as session:
-        async with session.post(
-            FIREBASE_SIGN_IN,
-            json={"email": email, "password": password, "returnSecureToken": True},
-            timeout=aiohttp.ClientTimeout(total=15),
-        ) as resp:
-            body = await resp.json(content_type=None)
-            if resp.status != 200:
-                error = body.get("error", {})
-                code  = error.get("message", "UNKNOWN")
-                friendly = {
-                    "EMAIL_NOT_FOUND":         "No account found with that email address.",
-                    "INVALID_PASSWORD":        "Incorrect password. Please try again.",
-                    "INVALID_EMAIL":           "Invalid email address.",
-                    "USER_DISABLED":           "This account has been disabled.",
-                    "TOO_MANY_ATTEMPTS_TRY_LATER": "Too many failed attempts. Please wait and try again.",
-                }.get(code, f"Sign-in failed: {code}")
-                raise ValueError(friendly)
-            return {
-                "id_token":      body["idToken"],
-                "refresh_token": body["refreshToken"],
-            }
+def _ha_url(hass) -> str:
+    """Return the internal HA base URL best suited for the local browser."""
+    try:
+        from homeassistant.helpers.network import get_url
+        return get_url(hass, prefer_external=False)
+    except Exception:
+        return ""
 
 
-async def _verify_api(id_token: str) -> dict | None:
+async def _discover_subscription_id(id_token: str) -> str:
     """
-    Quick sanity-check: call paxUser to confirm the token works against
-    the TransportMe API.  Returns paxUser data or None on soft failures.
+    Auto-discover the user's tracked routes via the trackingRoutes query.
+    Returns "operator_id:route_id,route_id,..." or "" on any failure.
+    The trackable_stops sub-field is intentionally omitted to avoid a
+    known server-side SQL bug on that field.
+    """
+    query = """
+    query trackingRoutes {
+        trackingRoutes {
+            id
+            name
+            trackable_routes { id name }
+        }
+    }
     """
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(
                 GRAPHQL_URL,
-                json={"query": "query { paxUser { id email fav_operator_id } }"},
+                json={"query": query},
                 headers={
                     "Authorization": f"Bearer {id_token}",
                     "Content-Type":  "application/json",
                 },
                 timeout=aiohttp.ClientTimeout(total=10),
             ) as resp:
-                if resp.status in (401, 403):
-                    return None
+                if resp.status != 200:
+                    return ""
                 body = await resp.json(content_type=None)
-                return body.get("data", {}).get("paxUser")
+                if "errors" in body:
+                    _LOGGER.debug("trackingRoutes errors: %s", body["errors"])
+                    return ""
+                tracking = body.get("data", {}).get("trackingRoutes", [])
+                if not tracking:
+                    return ""
+                op = tracking[0]
+                op_id = op.get("id")
+                route_ids = [
+                    str(r["id"])
+                    for r in op.get("trackable_routes", [])
+                    if r.get("id") is not None
+                ]
+                if not op_id or not route_ids:
+                    return ""
+                return f"{op_id}:{','.join(route_ids)}"
     except Exception:
-        return None
+        return ""
 
 
 # ---------------------------------------------------------------------------
@@ -93,74 +113,45 @@ async def _verify_api(id_token: str) -> dict | None:
 # ---------------------------------------------------------------------------
 
 class TransportMeConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
-    """
-    Multi-step config flow:
-      Step 1 (credentials) – email + password  →  Firebase auth
-      Step 2 (routes)      – subscription ID, stop coords, poll interval
-    """
+    """Two-step config flow: browser sign-in → route settings."""
 
     VERSION = 1
 
     def __init__(self) -> None:
-        self._id_token:      str = ""
-        self._refresh_token: str = ""
-        self._pax_user:      dict | None = None
+        self._id_token:       str = ""
+        self._refresh_token:  str = ""
+        self._pax_user:       dict | None = None
+        self._discovered_sub: str = ""
 
     # ------------------------------------------------------------------
-    # Step 1 – Credentials
+    # Step 1 – External browser sign-in
     # ------------------------------------------------------------------
 
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
     ) -> FlowResult:
-        errors: dict[str, str] = {}
+        """
+        First call: redirect user to the HA-hosted sign-in page.
+        Second call (via callback view): user_input contains {id_token,
+        refresh_token, email} — verify, discover routes, go to step 2.
+        """
+        if user_input and "id_token" in user_input:
+            # Tokens received from the sign-in page via the callback endpoint.
+            # The callback view already verified the token; call again to get
+            # fav_operator_id which we use for route discovery.
+            self._id_token      = user_input["id_token"]
+            self._refresh_token = user_input["refresh_token"]
+            self._pax_user      = await verify_transportme_token(self._id_token)
+            self._discovered_sub = await _discover_subscription_id(self._id_token)
+            return await self.async_step_routes()
 
-        if user_input is not None:
-            email    = user_input["email"].strip()
-            password = user_input["password"]
-            try:
-                tokens = await _firebase_sign_in(email, password)
-                self._id_token      = tokens["id_token"]
-                self._refresh_token = tokens["refresh_token"]
-            except ValueError as exc:
-                errors["base"] = str(exc)
-            except aiohttp.ClientError:
-                errors["base"] = "Cannot connect to authentication server. Check your internet connection."
-            except Exception:
-                errors["base"] = "Unexpected error during sign-in. Please try again."
-
-            if not errors:
-                # Verify against the TransportMe API
-                self._pax_user = await _verify_api(self._id_token)
-                if self._pax_user is None:
-                    errors["base"] = (
-                        "Signed in to Firebase but TransportMe API rejected the token. "
-                        "Make sure you are using your TransportMe account credentials."
-                    )
-
-            if not errors:
-                return await self.async_step_routes()
-
-        schema = vol.Schema({
-            vol.Required("email",    description={"suggested_value": ""}): str,
-            vol.Required("password", description={"suggested_value": ""}): str,
-        })
-
-        op_name = ""
-        if self._pax_user:
-            op_name = str(self._pax_user.get("fav_operator_id", ""))
-
-        return self.async_show_form(
-            step_id="user",
-            data_schema=schema,
-            errors=errors,
-            description_placeholders={
-                "title": "Sign in with your TransportMe email and password",
-            },
-        )
+        # Open the HA-hosted sign-in page in the user's browser.
+        base = _ha_url(self.hass)
+        url  = f"{base}/api/transportme/auth?flow_id={self.flow_id}&flow_type=config"
+        return self.async_external_step(step_id="user", url=url)
 
     # ------------------------------------------------------------------
-    # Step 2 – Routes & settings
+    # Step 2 – Route settings (auto-populated when possible)
     # ------------------------------------------------------------------
 
     async def async_step_routes(
@@ -168,20 +159,16 @@ class TransportMeConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     ) -> FlowResult:
         errors: dict[str, str] = {}
 
-        # Pre-fill operator id from paxUser if available
-        default_sub = ""
-        if self._pax_user and self._pax_user.get("fav_operator_id"):
-            op = self._pax_user["fav_operator_id"]
-            default_sub = f"{op}:"   # user completes with route IDs
+        default_sub = self._discovered_sub
+        if not default_sub and self._pax_user and self._pax_user.get("fav_operator_id"):
+            default_sub = f"{self._pax_user['fav_operator_id']}:"
 
         if user_input is not None:
             sub_id = user_input[CONF_SUBSCRIPTION_ID].strip()
             if not sub_id or ":" not in sub_id:
                 errors[CONF_SUBSCRIPTION_ID] = (
-                    "Enter as  operator_id:route_id,route_id  "
-                    "e.g.  123:1,2,3"
+                    "Enter as  operator_id:route_id,route_id  —  e.g. 123:1,2,3"
                 )
-
             if not errors:
                 await self.async_set_unique_id(f"{DOMAIN}_{sub_id}")
                 self._abort_if_unique_id_configured()
@@ -195,7 +182,6 @@ class TransportMeConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                         CONF_STOP_LAT:        user_input.get(CONF_STOP_LAT),
                         CONF_STOP_LON:        user_input.get(CONF_STOP_LON),
                         CONF_SCAN_INTERVAL:   user_input.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL),
-                        # Store email so options flow can display it
                         "signed_in_email":    self._pax_user.get("email", "") if self._pax_user else "",
                     },
                 )
@@ -203,7 +189,7 @@ class TransportMeConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         schema = vol.Schema({
             vol.Required(
                 CONF_SUBSCRIPTION_ID,
-                description={"suggested_value": default_sub or "123:1,2,3"},
+                description={"suggested_value": default_sub or ""},
             ): str,
             vol.Optional(CONF_STOP_LAT): vol.Coerce(float),
             vol.Optional(CONF_STOP_LON): vol.Coerce(float),
@@ -215,23 +201,25 @@ class TransportMeConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
         pax_info = ""
         if self._pax_user:
-            pax_info = f"Signed in as {self._pax_user.get('email', '')} (user {self._pax_user.get('id', '')})"
+            pax_info = (
+                f"Signed in as {self._pax_user.get('email', '')} "
+                f"(user {self._pax_user.get('id', '')})"
+            )
+
+        if self._discovered_sub:
+            hint = f"Routes auto-discovered: {self._discovered_sub}"
+        else:
+            hint = "Format:  operator_id:route_id,route_id,...  e.g. 123:1,2,3"
 
         return self.async_show_form(
             step_id="routes",
             data_schema=schema,
             errors=errors,
-            description_placeholders={
-                "pax_info": pax_info,
-                "hint": (
-                    "Subscription ID format:  operator_id:route_id,route_id,...\n"
-                    "Example: 123:1,2,3"
-                ),
-            },
+            description_placeholders={"pax_info": pax_info, "hint": hint},
         )
 
     # ------------------------------------------------------------------
-    # Options flow (Configure button after setup)
+    # Options flow
     # ------------------------------------------------------------------
 
     @staticmethod
@@ -241,43 +229,37 @@ class TransportMeConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
 
 # ---------------------------------------------------------------------------
-# Options flow – settings + optional re-authentication
+# Options flow
 # ---------------------------------------------------------------------------
 
 class TransportMeOptionsFlow(config_entries.OptionsFlow):
     """
-    Configure page flow:
-      Step init    – settings form (pre-filled), with a re-authenticate toggle
-      Step reauth  – email + password (only if re-authenticate was ticked)
+    Configure page:
+      init   – pre-filled settings + Re-authenticate toggle
+      reauth – external browser sign-in (only when toggle is ticked)
     """
 
     def __init__(self, config_entry: config_entries.ConfigEntry) -> None:
         self._config_entry   = config_entry
         self._id_token:      str = config_entry.data.get(CONF_AUTH_TOKEN, "")
         self._refresh_token: str = config_entry.data.get(CONF_REFRESH_TOKEN, "")
-        # Pending settings saved while we do re-auth
         self._pending: dict[str, Any] = {}
 
     # ------------------------------------------------------------------
-    # Step init – main settings, shown immediately when Configure is clicked
+    # Step init
     # ------------------------------------------------------------------
 
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None
     ) -> FlowResult:
-        data   = self._config_entry.data
+        data = self._config_entry.data
         errors: dict[str, str] = {}
-        signed_in_email = data.get("signed_in_email", "your account")
 
         if user_input is not None:
             wants_reauth = user_input.pop("re_authenticate", False)
             self._pending = user_input
-
             if wants_reauth:
-                # Go to re-auth step before saving
                 return await self.async_step_reauth()
-
-            # Save immediately with existing tokens
             return self._save(self._pending)
 
         schema = vol.Schema({
@@ -299,62 +281,42 @@ class TransportMeOptionsFlow(config_entries.OptionsFlow):
             ): vol.All(vol.Coerce(int), vol.Range(min=10, max=300)),
             vol.Optional("re_authenticate", default=False): bool,
         })
-
         return self.async_show_form(
             step_id="init",
             data_schema=schema,
             errors=errors,
             description_placeholders={
-                "signed_in_email": signed_in_email,
+                "signed_in_email": data.get("signed_in_email", "your account"),
             },
         )
 
     # ------------------------------------------------------------------
-    # Step reauth – only shown when re_authenticate toggle is ticked
+    # Step reauth – external browser sign-in
     # ------------------------------------------------------------------
 
     async def async_step_reauth(
         self, user_input: dict[str, Any] | None = None
     ) -> FlowResult:
-        errors: dict[str, str] = {}
+        """
+        First call: open browser sign-in page.
+        Second call (via callback): tokens received → save.
+        """
+        if user_input and "id_token" in user_input:
+            self._id_token      = user_input["id_token"]
+            self._refresh_token = user_input["refresh_token"]
+            self._pending["signed_in_email"] = user_input.get("email", "")
+            return self._save(self._pending)
 
-        if user_input is not None:
-            email    = (user_input.get("email") or "").strip()
-            password = (user_input.get("password") or "").strip()
-            try:
-                tokens = await _firebase_sign_in(email, password)
-                self._id_token      = tokens["id_token"]
-                self._refresh_token = tokens["refresh_token"]
-                # Store new email for future display
-                self._pending["signed_in_email"] = email
-            except ValueError as exc:
-                errors["base"] = str(exc)
-            except Exception:
-                errors["base"] = "Sign-in failed. Please check your credentials and try again."
-
-            if not errors:
-                return self._save(self._pending)
-
-        schema = vol.Schema({
-            vol.Required("email"):    str,
-            vol.Required("password"): str,
-        })
-
-        return self.async_show_form(
-            step_id="reauth",
-            data_schema=schema,
-            errors=errors,
-            description_placeholders={
-                "current_email": self._config_entry.data.get("signed_in_email", ""),
-            },
-        )
+        base = _ha_url(self.hass)
+        url  = f"{base}/api/transportme/auth?flow_id={self.flow_id}&flow_type=options"
+        return self.async_external_step(step_id="reauth", url=url)
 
     # ------------------------------------------------------------------
     # Save helper
     # ------------------------------------------------------------------
 
     def _save(self, settings: dict[str, Any]) -> FlowResult:
-        """Merge updated settings + current tokens back into config entry."""
+        """Merge updated settings + tokens back into the config entry."""
         data = self._config_entry.data
         updated = {
             **data,
