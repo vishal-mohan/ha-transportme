@@ -326,11 +326,16 @@ _AUTH_HTML = """\
     });
     const d = await r.json();
     if (!r.ok) {
-      const isExpired = r.status === 404;
+      if (r.status === 404) {
+        const detail = d.detail ? `<br><small style="opacity:.7">${d.detail}</small>` : "";
+        throw new Error(
+          "Setup session expired — please close this tab, go back to Home Assistant, and start the setup again." + detail
+        );
+      }
       throw new Error(
-        isExpired
-          ? "Setup session expired — please close this tab, go back to Home Assistant, and start the setup again."
-          : (d.error || "Sign-in failed. Please try again.")
+        (d.detail ? `Internal error: ${d.detail}` : null)
+        || d.error
+        || "Sign-in failed. Please try again."
       );
     }
     document.getElementById("card").innerHTML = `
@@ -415,6 +420,20 @@ class TransportMeCallbackView(HomeAssistantView):
 
         # Advance the correct flow manager
         flow_mgr = hass.config_entries.options if flow_type == "options" else hass.config_entries.flow
+
+        # Check flow exists before trying to advance it
+        in_progress = flow_mgr.async_progress()
+        if not any(f["flow_id"] == flow_id for f in in_progress):
+            _LOGGER.warning(
+                "TransportMe callback: flow %s not found. In-progress flows: %s",
+                flow_id,
+                [f["flow_id"] for f in in_progress],
+            )
+            return web.json_response(
+                {"error": "session_expired", "detail": "Flow not found — it may have expired or HA was restarted."},
+                status=404,
+            )
+
         try:
             await flow_mgr.async_configure(
                 flow_id,
@@ -425,10 +444,11 @@ class TransportMeCallbackView(HomeAssistantView):
                 },
             )
         except Exception as exc:
-            _LOGGER.warning("TransportMe callback: could not advance flow %s: %s", flow_id, exc)
+            _LOGGER.exception("TransportMe callback: error advancing flow %s", flow_id)
+            exc_detail = f"{type(exc).__name__}: {exc}"
             return web.json_response(
-                {"error": "Sign-in session expired or not found. Please restart the setup."},
-                status=404,
+                {"error": "flow_error", "detail": exc_detail},
+                status=500,
             )
 
         return web.json_response({"success": True, "email": pax_user.get("email", "")})

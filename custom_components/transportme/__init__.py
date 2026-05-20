@@ -23,6 +23,7 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     from .views import TransportMeAuthView, TransportMeCallbackView
     hass.http.register_view(TransportMeAuthView())
     hass.http.register_view(TransportMeCallbackView())
+    hass.data[f"{DOMAIN}_views_registered"] = True
     return True
 
 
