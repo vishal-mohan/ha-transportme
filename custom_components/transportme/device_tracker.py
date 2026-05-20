@@ -1,8 +1,7 @@
 """Device tracker platform for TransportMe – shows bus on the HA map."""
 from __future__ import annotations
 
-from homeassistant.components.device_tracker import SOURCE_TYPE_GPS
-from homeassistant.components.device_tracker.config_entry import TrackerEntity
+from homeassistant.components.device_tracker import SourceType, TrackerEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
@@ -25,7 +24,7 @@ class TransportMeBusTracker(CoordinatorEntity[TransportMeCoordinator], TrackerEn
     """Represents the live position of the tracked bus on the HA map."""
 
     _attr_icon = "mdi:bus-clock"
-    _attr_source_type = SOURCE_TYPE_GPS
+    _attr_source_type = SourceType.GPS
 
     def __init__(self, coordinator: TransportMeCoordinator, entry: ConfigEntry) -> None:
         super().__init__(coordinator)
