@@ -127,6 +127,22 @@ class TransportMeConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     # Step 1 – External browser sign-in
     # ------------------------------------------------------------------
 
+    def _ensure_views(self) -> None:
+        """Register HTTP views if not already done.
+
+        async_setup in __init__.py handles this at startup, but when HA loads
+        the component for the first time solely to run a config flow (no existing
+        entries) async_setup may not have been awaited yet.  Registering here is
+        a safe no-op if the views are already registered.
+        """
+        key = f"{DOMAIN}_views_registered"
+        if self.hass.data.get(key):
+            return
+        from .views import TransportMeAuthView, TransportMeCallbackView
+        self.hass.http.register_view(TransportMeAuthView())
+        self.hass.http.register_view(TransportMeCallbackView())
+        self.hass.data[key] = True
+
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
     ) -> FlowResult:
@@ -135,6 +151,8 @@ class TransportMeConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         Second call (via callback view): user_input contains {id_token,
         refresh_token, email} — verify, discover routes, go to step 2.
         """
+        self._ensure_views()
+
         if user_input and "id_token" in user_input:
             # Tokens received from the sign-in page via the callback endpoint.
             # The callback view already verified the token; call again to get
@@ -301,6 +319,14 @@ class TransportMeOptionsFlow(config_entries.OptionsFlow):
         First call: open browser sign-in page.
         Second call (via callback): tokens received → save.
         """
+        # Views may not be registered if HA was restarted since initial setup
+        key = f"{DOMAIN}_views_registered"
+        if not self.hass.data.get(key):
+            from .views import TransportMeAuthView, TransportMeCallbackView
+            self.hass.http.register_view(TransportMeAuthView())
+            self.hass.http.register_view(TransportMeCallbackView())
+            self.hass.data[key] = True
+
         if user_input and "id_token" in user_input:
             self._id_token      = user_input["id_token"]
             self._refresh_token = user_input["refresh_token"]
