@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>TransportMe – Get Auth Token</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 640px; margin: 60px auto; padding: 0 20px; background: #f5f5f5; }
+    h1 { color: #e65100; }
+    button { background: #e65100; color: white; border: none; padding: 12px 24px; font-size: 16px; border-radius: 6px; cursor: pointer; }
+    button:hover { background: #bf360c; }
+    .box { background: white; border-radius: 8px; padding: 20px; margin-top: 20px; word-break: break-all; }
+    .label { font-weight: bold; margin-bottom: 8px; color: #555; }
+    .token { font-family: monospace; font-size: 12px; background: #f0f0f0; padding: 10px; border-radius: 4px; }
+    .copy-btn { margin-top: 10px; background: #555; font-size: 13px; padding: 6px 14px; }
+    .step { background: #fff3e0; border-left: 4px solid #e65100; padding: 12px 16px; margin-bottom: 12px; border-radius: 0 6px 6px 0; }
+    #status { margin-top: 16px; color: green; font-weight: bold; }
+    #error  { margin-top: 16px; color: red; }
+    .hidden { display: none; }
+    .divider { display: flex; align-items: center; gap: 12px; margin: 20px 0; color: #999; }
+    .divider::before, .divider::after { content: ''; flex: 1; height: 1px; background: #ddd; }
+    .method-box { background: white; border-radius: 8px; padding: 20px; margin-bottom: 16px; }
+    .method-box h3 { margin: 0 0 14px; color: #333; font-size: 15px; }
+    input[type=email], input[type=password] {
+      width: 100%; padding: 10px 12px; margin-bottom: 10px; border: 1px solid #ccc;
+      border-radius: 6px; font-size: 15px; box-sizing: border-box;
+    }
+    input:focus { outline: none; border-color: #e65100; }
+    .google-btn { background: white; color: #444; border: 1px solid #ccc; display: flex; align-items: center; gap: 10px; }
+    .google-btn:hover { background: #f5f5f5; }
+    .google-btn svg { width: 20px; height: 20px; flex-shrink: 0; }
+  </style>
+</head>
+<body>
+  <h1>🚌 TransportMe Token Helper</h1>
+  <p>Sign in with the same account you use in the TransportMe app to get your auth token for Home Assistant.</p>
+
+  <div class="step">Step 1 — Sign in below using your TransportMe account (email/password <em>or</em> Google).</div>
+  <div class="step">Step 2 — Copy the <strong>ID Token</strong> and <strong>Refresh Token</strong> that appear.</div>
+  <div class="step">Step 3 — Paste them into the Home Assistant integration setup.</div>
+
+  <!-- Email / Password -->
+  <div class="method-box">
+    <h3>Sign in with Email &amp; Password</h3>
+    <input type="email"    id="email"    placeholder="your@email.com" autocomplete="username" />
+    <input type="password" id="password" placeholder="Password"       autocomplete="current-password" />
+    <button onclick="signInEmail()">Sign in</button>
+  </div>
+
+  <div class="divider">or</div>
+
+  <!-- Google OAuth -->
+  <div class="method-box">
+    <h3>Sign in with Google</h3>
+    <button class="google-btn" onclick="signInGoogle()">
+      <svg viewBox="0 0 48 48"><path fill="#EA4335" d="M24 9.5c3.5 0 6.6 1.2 9 3.2l6.7-6.7C35.7 2.5 30.2 0 24 0 14.8 0 6.9 5.4 3 13.3l7.8 6C12.7 13.1 17.9 9.5 24 9.5z"/><path fill="#4285F4" d="M46.5 24.5c0-1.6-.1-3.1-.4-4.5H24v8.5h12.7c-.6 3-2.3 5.5-4.8 7.2l7.5 5.8c4.4-4.1 7.1-10.1 7.1-17z"/><path fill="#FBBC05" d="M10.8 28.7A14.5 14.5 0 0 1 9.5 24c0-1.6.3-3.2.8-4.7L2.5 13.3A23.9 23.9 0 0 0 0 24c0 3.8.9 7.4 2.5 10.7l8.3-6z"/><path fill="#34A853" d="M24 48c6.2 0 11.4-2 15.2-5.5l-7.5-5.8c-2 1.4-4.6 2.2-7.7 2.2-6.1 0-11.3-3.6-13.2-8.8l-7.8 6C6.9 42.6 14.8 48 24 48z"/></svg>
+      Sign in with Google
+    </button>
+  </div>
+
+  <p id="status" class="hidden"></p>
+  <p id="error"  class="hidden"></p>
+
+  <div id="results" class="hidden">
+    <div class="box">
+      <div class="label">ID Token (paste as Auth Token in HA — expires in 1 hour)</div>
+      <div class="token" id="idToken"></div>
+      <button class="copy-btn" onclick="copy('idToken', this)">Copy ID Token</button>
+    </div>
+    <div class="box">
+      <div class="label">Refresh Token (enables auto-renewal — paste this too)</div>
+      <div class="token" id="refreshToken"></div>
+      <button class="copy-btn" onclick="copy('refreshToken', this)">Copy Refresh Token</button>
+    </div>
+    <div class="box">
+      <div class="label">Signed in as</div>
+      <div class="token" id="userInfo"></div>
+    </div>
+  </div>
+
+  <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-app-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-auth-compat.js"></script>
+  <script>
+    const firebaseConfig = {
+      apiKey:            "AIzaSyD9xVRwjC0V-FHj5D97pwD8oGUNCufs9vI",
+      authDomain:        "transportme-passenger-prod.firebaseapp.com",
+      projectId:         "transportme-passenger-prod",
+      storageBucket:     "transportme-passenger-prod.appspot.com",
+      messagingSenderId: "779098563743",
+      appId:             "1:779098563743:web:8aecbcb11dc4fee5c86eaa",
+    };
+    firebase.initializeApp(firebaseConfig);
+    const auth = firebase.auth();
+
+    async function showTokens(user) {
+      const idToken      = await user.getIdToken(true);
+      const refreshToken = user.refreshToken;
+      document.getElementById('idToken').textContent      = idToken;
+      document.getElementById('refreshToken').textContent = refreshToken;
+      document.getElementById('userInfo').textContent     =
+        `Email: ${user.email}\nUID: ${user.uid}\nName: ${user.displayName || '(not set)'}`;
+      document.getElementById('results').classList.remove('hidden');
+      const s = document.getElementById('status');
+      s.textContent = '✅ Signed in! Copy your tokens below.';
+      s.classList.remove('hidden');
+      document.getElementById('error').classList.add('hidden');
+    }
+
+    async function signInEmail() {
+      clearMessages();
+      const email    = document.getElementById('email').value.trim();
+      const password = document.getElementById('password').value;
+      if (!email || !password) { showError('Please enter your email and password.'); return; }
+      try {
+        const result = await auth.signInWithEmailAndPassword(email, password);
+        await showTokens(result.user);
+      } catch (e) {
+        showError(friendlyError(e));
+      }
+    }
+
+    async function signInGoogle() {
+      clearMessages();
+      try {
+        const provider = new firebase.auth.GoogleAuthProvider();
+        const result   = await auth.signInWithPopup(provider);
+        await showTokens(result.user);
+      } catch (e) {
+        showError(friendlyError(e));
+      }
+    }
+
+    function friendlyError(e) {
+      const map = {
+        'auth/user-not-found':      'No account found with that email. Check the email address.',
+        'auth/wrong-password':      'Incorrect password. Please try again.',
+        'auth/invalid-email':       'Invalid email address.',
+        'auth/too-many-requests':   'Too many attempts. Please wait a moment and try again.',
+        'auth/network-request-failed': 'Network error. Check your internet connection.',
+        'auth/popup-closed-by-user':   'Sign-in popup was closed. Please try again.',
+      };
+      return map[e.code] || e.message;
+    }
+
+    function clearMessages() {
+      document.getElementById('error').classList.add('hidden');
+      document.getElementById('status').classList.add('hidden');
+    }
+
+    function showError(msg) {
+      const el = document.getElementById('error');
+      el.textContent = 'Error: ' + msg;
+      el.classList.remove('hidden');
+    }
+
+    function copy(elId, btn) {
+      navigator.clipboard.writeText(document.getElementById(elId).textContent).then(() => {
+        const orig = btn.textContent;
+        btn.textContent = '✓ Copied!';
+        setTimeout(() => btn.textContent = orig, 2000);
+      });
+    }
+  </script>
+</body>
+</html>

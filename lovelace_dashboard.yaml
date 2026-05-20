@@ -1,0 +1,86 @@
+# ============================================================
+# TransportMe Bus Tracker – Lovelace Dashboard
+# ============================================================
+# Replace every occurrence of "12345" with your subscription ID.
+# Add this as a new Dashboard view in Home Assistant:
+#   Settings → Dashboards → + Add Dashboard → YAML mode
+# ============================================================
+
+views:
+  - title: My Bus
+    icon: mdi:bus-clock
+    path: transportme
+    cards:
+
+      # ----------------------------------------------------------
+      # 1. Live map showing the bus position
+      # ----------------------------------------------------------
+      - type: map
+        title: Bus Location
+        entities:
+          - entity: device_tracker.transportme_bus_12345
+            color: "#FF6600"
+        hours_to_show: 0.5   # show last 30 min of track
+        default_zoom: 14
+
+      # ----------------------------------------------------------
+      # 2. Key metrics at a glance
+      # ----------------------------------------------------------
+      - type: glance
+        title: Bus Status
+        show_name: true
+        show_icon: true
+        entities:
+          - entity: sensor.transportme_12345_bus_eta
+            name: ETA (min)
+          - entity: sensor.transportme_12345_bus_distance
+            name: Distance (km)
+          - entity: sensor.transportme_12345_bus_speed
+            name: Speed (km/h)
+          - entity: sensor.transportme_12345_bus_status
+            name: Status
+
+      # ----------------------------------------------------------
+      # 3. ETA gauge – fills up as bus approaches
+      # ----------------------------------------------------------
+      - type: gauge
+        entity: sensor.transportme_12345_bus_eta
+        name: Bus ETA
+        unit: min
+        min: 0
+        max: 60
+        needle: true
+        segments:
+          - from: 0
+            color: "#db4437"   # red  – bus is almost here
+          - from: 5
+            color: "#f4b400"   # amber – get ready
+          - from: 15
+            color: "#0f9d58"   # green – plenty of time
+
+      # ----------------------------------------------------------
+      # 4. History graph – track ETA trend over last hour
+      # ----------------------------------------------------------
+      - type: history-graph
+        title: ETA over the last hour
+        hours_to_show: 1
+        entities:
+          - entity: sensor.transportme_12345_bus_eta
+            name: ETA
+          - entity: sensor.transportme_12345_bus_distance
+            name: Distance
+
+      # ----------------------------------------------------------
+      # 5. Conditional alert card – appears only when bus < 5 min
+      # ----------------------------------------------------------
+      - type: conditional
+        conditions:
+          - entity: sensor.transportme_12345_bus_eta
+            state_filter:
+              - "< 5"
+        card:
+          type: markdown
+          content: >
+            ## 🚌 Bus arriving now!
+            Your bus is **{{ states('sensor.transportme_12345_bus_eta') }} minutes** away.
+            Head to the stop!

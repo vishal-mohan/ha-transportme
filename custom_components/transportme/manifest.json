@@ -1,0 +1,12 @@
+{
+  "domain": "transportme",
+  "name": "TransportMe Bus Tracker",
+  "version": "1.0.0",
+  "documentation": "https://github.com/vishal-mohan/transportme-ha",
+  "issue_tracker": "https://github.com/vishal-mohan/transportme-ha/issues",
+  "dependencies": [],
+  "codeowners": ["@vishal-mohan"],
+  "requirements": [],
+  "iot_class": "cloud_polling",
+  "config_flow": true
+}
