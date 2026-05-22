@@ -32,7 +32,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.data.setdefault(DOMAIN, {})
 
     interval = entry.data.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL)
-    coordinator = TransportMeCoordinator(hass, dict(entry.data), interval)
+    coordinator = TransportMeCoordinator(hass, entry, interval)
 
     # Initial fetch – raises ConfigEntryNotReady on failure so HA retries
     await coordinator.async_config_entry_first_refresh()

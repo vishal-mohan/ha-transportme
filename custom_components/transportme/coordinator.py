@@ -1,7 +1,6 @@
 """DataUpdateCoordinator for TransportMe Bus Tracker (GraphQL API)."""
 from __future__ import annotations
 
-import asyncio
 import logging
 import math
 from datetime import timedelta
@@ -9,6 +8,7 @@ from typing import Any
 
 import aiohttp
 
+from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
@@ -24,6 +24,11 @@ from .const import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+
+# GraphQL / HTTP error message fragments that indicate an expired / invalid token.
+# Kept broad to catch whatever wording the TransportMe backend uses.
+_AUTH_ERR_MSGS  = frozenset({"token", "jwt", "auth", "unauthori", "expire", "credential", "forbidden"})
+_AUTH_ERR_CODES = frozenset({"UNAUTHENTICATED", "FORBIDDEN", "UNAUTHORIZED", "TOKEN_EXPIRED"})
 
 GRAPHQL_URL      = "https://production.api2.transportme.com.au/"
 # Public client-side key embedded in the TransportMe app bundle (safe to publish)
@@ -91,9 +96,11 @@ class TransportMeCoordinator(DataUpdateCoordinator):
     def __init__(
         self,
         hass: HomeAssistant,
-        config_entry_data: dict,
+        entry: ConfigEntry,
         update_interval: int,
     ) -> None:
+        self._entry         = entry
+        config_entry_data   = dict(entry.data)
         self._url           = config_entry_data.get(CONF_API_BASE_URL, GRAPHQL_URL)
         self._token         = config_entry_data.get(CONF_AUTH_TOKEN, "")
         self._refresh_token = config_entry_data.get(CONF_REFRESH_TOKEN, "")
@@ -138,8 +145,11 @@ class TransportMeCoordinator(DataUpdateCoordinator):
             resp.raise_for_status()
             data = await resp.json(content_type=None)
             if "errors" in data:
-                err_msg = data["errors"][0].get("message", "unknown")
-                if "token" in err_msg.lower() or data["errors"][0].get("extensions", {}).get("code") == "UNAUTHENTICATED":
+                err        = data["errors"][0]
+                err_msg    = err.get("message", "unknown")
+                err_lower  = err_msg.lower()
+                ext_code   = str(err.get("extensions", {}).get("code", "")).upper()
+                if (any(p in err_lower for p in _AUTH_ERR_MSGS) or ext_code in _AUTH_ERR_CODES):
                     raise _TokenExpiredError()
                 raise UpdateFailed(f"GraphQL error: {err_msg}")
             return data
@@ -169,6 +179,13 @@ class TransportMeCoordinator(DataUpdateCoordinator):
                 raise UpdateFailed("Token refresh response missing id_token")
             self._token = new_token
             _LOGGER.info("TransportMe: Firebase token auto-refreshed successfully.")
+            # Persist the fresh token so HA doesn't start with an expired one
+            # after a restart. We update the entry data directly to avoid
+            # triggering the update listener (which would cause a full reload).
+            self.hass.config_entries.async_update_entry(
+                self._entry,
+                data={**self._entry.data, CONF_AUTH_TOKEN: new_token},
+            )
 
     # ------------------------------------------------------------------
     # API calls
