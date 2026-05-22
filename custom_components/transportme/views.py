@@ -165,17 +165,22 @@ _AUTH_HTML = """\
       Sign in with Google
     </button>
 
-    <!-- Shown when popup is blocked by Firebase domain restriction -->
-    <div id="goog-localhost-hint" style="display:none">
-      <div class="hint" style="margin-bottom:14px">
-        <strong>Google sign-in requires opening this page via localhost.</strong><br><br>
-        Your HA is on a local IP — open the link below in a new tab instead:
-        <div style="margin-top:10px;display:flex;gap:8px;align-items:center">
-          <code id="localhost-url" style="flex:1;word-break:break-all;font-size:11px"></code>
-          <button onclick="copyLocalhostUrl()" style="white-space:nowrap;padding:6px 12px;border:1px solid #ddd;border-radius:6px;background:#fff;cursor:pointer;font-size:12px">Copy</button>
-        </div>
-        <div style="margin-top:8px;font-size:12px;color:#888">
-          Open that URL, sign in with Google, and this setup will complete automatically.
+    <!-- Shown when Firebase blocks the popup (HA on a local IP / remote device) -->
+    <div id="goog-hint" style="display:none">
+      <div class="hint">
+        <strong>Google sign-in isn't available when Home Assistant is on a different device.</strong><br><br>
+        The easiest fix — takes about 30 seconds:<br>
+        <ol style="padding-left:18px;margin:8px 0">
+          <li>Open the <strong>TransportMe app</strong> on your phone.</li>
+          <li>Go to <strong>Account → Settings → Set / Add password</strong>.</li>
+          <li>Come back here and use the <strong>Email / Password</strong> tab.</li>
+        </ol>
+        <button onclick="showTab('ep')" style="margin-top:4px;padding:8px 16px;border:none;border-radius:6px;background:#e65100;color:#fff;font-size:13px;font-weight:600;cursor:pointer">
+          Switch to Email / Password →
+        </button>
+        <div style="margin-top:12px;font-size:12px;color:#999;border-top:1px solid #eee;padding-top:10px">
+          Running Home Assistant <em>on this computer</em>?
+          <a id="lh-link" href="#" target="_blank" style="color:#e65100">Try signing in via localhost instead.</a>
         </div>
       </div>
     </div>
@@ -265,6 +270,8 @@ _AUTH_HTML = """\
     return firebase.auth(_fbApp);
   }
 
+  // URL for the same sign-in page re-opened via localhost:8123.
+  // localhost is always an authorised Firebase domain, so signInWithPopup works there.
   async function signInGoogle() {
     clearErr();
     const btn = document.getElementById("btn-google-popup");
@@ -277,18 +284,14 @@ _AUTH_HTML = """\
       await sendToHA(idToken, result.user.refreshToken);
     } catch (e) {
       if (e.code === "auth/unauthorized-domain") {
-        // Firebase blocked the popup — show localhost URL alternative
-        const here    = window.location.href;
-        const lhUrl   = here.replace(/^https?:[/][/][^/]+/, "http://localhost:8123");
-        document.getElementById("localhost-url").textContent = lhUrl;
-        document.getElementById("goog-localhost-hint").style.display = "";
-        showErr(
-          "Google sign-in is blocked when HA is accessed via a local IP address.<br>" +
-          "Use the <strong>localhost URL</strong> below, or paste tokens manually."
-        );
-      } else if (e.code === "auth/popup-closed-by-user") {
-        // silent
-      } else {
+        // Google OAuth can't run from a local IP address.
+        // Show guidance: set a password in the TransportMe app, then use
+        // Email/Password.  Also expose a localhost link for the rare case
+        // where HA is running on the same computer as the browser.
+        const lhUrl = "http://localhost:8123" + window.location.pathname + window.location.search;
+        document.getElementById("lh-link").href = lhUrl;
+        document.getElementById("goog-hint").style.display = "";
+      } else if (e.code !== "auth/popup-closed-by-user") {
         showErr(e.message || "Google sign-in failed.");
       }
     } finally {
@@ -296,14 +299,20 @@ _AUTH_HTML = """\
     }
   }
 
-  function copyLocalhostUrl() {
-    const url = document.getElementById("localhost-url").textContent;
-    navigator.clipboard.writeText(url).then(() => {
-      const btn = event.target;
-      btn.textContent = "Copied ✓";
-      setTimeout(() => btn.textContent = "Copy", 2000);
-    });
-  }
+  // If this page was opened as a localhost popup from another HA tab,
+  // notify that tab when auth finishes so it updates automatically.
+  window.addEventListener("message", (event) => {
+    if (event.origin !== "http://localhost:8123") return;
+    if (event.data && event.data.type === "transportme_auth_done") {
+      document.getElementById("card").innerHTML = `
+        <div class="success">
+          <div class="icon">✅</div>
+          <h2>Signed in successfully!</h2>
+          <p>Close this tab and return to Home Assistant.<br>
+             Click <strong>Submit</strong> in the dialog to continue.</p>
+        </div>`;
+    }
+  });
 
   // ── Manual token paste (fallback for Google users) ────────────────
   async function submitToken() {
@@ -339,6 +348,11 @@ _AUTH_HTML = """\
         || d.error
         || "Sign-in failed. Please try again."
       );
+    }
+    // If opened as a popup from another HA tab, notify the parent so it
+    // can update its UI without the user needing to switch back manually.
+    if (window.opener) {
+      try { window.opener.postMessage({ type: "transportme_auth_done" }, "*"); } catch (_) {}
     }
     document.getElementById("card").innerHTML = `
       <div class="success">

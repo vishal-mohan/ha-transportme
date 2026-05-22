@@ -10,6 +10,7 @@ from typing import Any
 import aiohttp
 
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .const import (
@@ -99,7 +100,6 @@ class TransportMeCoordinator(DataUpdateCoordinator):
         self._subscription_id = config_entry_data.get(CONF_SUBSCRIPTION_ID, "")
         self._stop_lat      = config_entry_data.get(CONF_STOP_LAT)
         self._stop_lon      = config_entry_data.get(CONF_STOP_LON)
-        self._session: aiohttp.ClientSession | None = None
 
         # Cached route list from trackingRoutes query
         self._routes: list[dict] | None = None
@@ -122,13 +122,8 @@ class TransportMeCoordinator(DataUpdateCoordinator):
             "Authorization": f"Bearer {self._token}",
         }
 
-    async def _get_session(self) -> aiohttp.ClientSession:
-        if self._session is None or self._session.closed:
-            self._session = aiohttp.ClientSession()
-        return self._session
-
     async def _gql(self, query: str, variables: dict | None = None) -> dict[str, Any]:
-        session = await self._get_session()
+        session = async_get_clientsession(self.hass)
         payload: dict[str, Any] = {"query": query}
         if variables:
             payload["variables"] = variables
@@ -157,10 +152,10 @@ class TransportMeCoordinator(DataUpdateCoordinator):
         if not self._refresh_token:
             raise UpdateFailed(
                 "Auth token expired and no refresh token stored. "
-                "Re-open get_token.html to get a new token, or add your refresh token in "
-                "Settings → Devices & Services → TransportMe → Configure."
+                "Go to Settings → Devices & Services → TransportMe → Configure "
+                "and tick 'Sign in again' to re-authenticate."
             )
-        session = await self._get_session()
+        session = async_get_clientsession(self.hass)
         async with session.post(
             TOKEN_REFRESH_URL,
             json={"grant_type": "refresh_token", "refresh_token": self._refresh_token},
