@@ -1,7 +1,7 @@
 {
   "domain": "transportme",
   "name": "TransportMe Bus Tracker",
-  "version": "1.0.0",
+  "version": "1.0.4",
   "documentation": "https://github.com/vishal-mohan/ha-transportme",
   "issue_tracker": "https://github.com/vishal-mohan/ha-transportme/issues",
   "dependencies": [],
